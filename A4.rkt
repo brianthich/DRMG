@@ -2,296 +2,268 @@
 
 (require typed/rackunit)
 
-;; Arith data definitions
-(define-type ExprC (U numC binopC ifleq0? idC appC))
-(struct numC ([n : Real]) #:transparent)
-(struct binopC ([op : Symbol] [l : ExprC] [r : ExprC]) #:transparent)
-(struct fundefC ([name : Symbol] [params : (Listof Symbol)] [body : ExprC]) #:transparent)
-(struct ifleq0? ([n : ExprC] [t : ExprC] [f : ExprC]) #:transparent)
-(struct idC ([name : Symbol]) #:transparent)
-(struct appC ([name : Symbol] [params : (Listof ExprC)]) #:transparent)
+;; Progress: Implements DRMG4 parsing, environments, closures, primitives,
+;; booleans, strings, conditionals, local desugaring, serialization, and tests.
+
+(define-type ExprC (U NumC BoolC StrC IdC IfC LamC AppC))
+(struct NumC ([n : Real]) #:transparent)
+(struct BoolC ([b : Boolean]) #:transparent)
+(struct StrC ([s : String]) #:transparent)
+(struct IdC ([name : Symbol]) #:transparent)
+(struct IfC ([test : ExprC] [yes : ExprC] [no : ExprC]) #:transparent)
+(struct LamC ([params : (Listof Symbol)] [body : ExprC]) #:transparent)
+(struct AppC ([fun : ExprC] [args : (Listof ExprC)]) #:transparent)
+
+(define-type Value (U NumV BoolV StrV ClosureV PrimV))
+(struct NumV ([n : Real]) #:transparent)
+(struct BoolV ([b : Boolean]) #:transparent)
+(struct StrV ([s : String]) #:transparent)
+(struct ClosureV ([params : (Listof Symbol)] [body : ExprC] [env : Environment]) #:transparent)
+(struct PrimV ([name : Symbol]) #:transparent)
+(struct Binding ([name : Symbol] [value : Value]) #:transparent)
 (define-type Environment (Listof Binding))
-(struct Binding ([name : Symbol] [value : Real]) #:transparent)
 
-;; Takes two real numbers and returns the quotient if valid, or reports division by zero
-(define (sf [l : Real] [r : Real]): Real
-  (if (zero? r)
-      (error 'DRMG "division by zero: ~e" (list '/ l r))
-      (/ l r)))
+;; Reserved syntax words cannot be used as identifiers; primitive names can.
+(define reserved (set 'if '= 'local '% '-> 'in))
 
-;; Hash table for operator symbols
-(define ops
-        (hash '+ +
-              '- -
-              '* *
-              '/ sf))
-
-;; Hash table for reserved symbols
-(define reserved (set
-             '=
-             'ifleq0?))
-
-;; Takes a name and an env and sees if the name is in the env, if so returns its value
-(define (lookup [name : Symbol] [env : Environment]) : Real
-  (match env
-    [(cons (Binding n v) r) #:when (equal? n name) v]
-    [(cons _ r) (lookup name r)]
-    ['() (error 'DRMG "Binding ~e not found in environment: ~e" name env)]))
-
-;; Takes an s expression and returns its ArithC form
-(define (parse [s : Sexp]) : ExprC
-  (match s
-    [(? real? n) (numC n)]
-    [(? symbol? s) #:when (not (check-invalid-symbols (list s))) (idC s)]
-    [(list (? symbol? op) l r) #:when (hash-has-key? ops op)
-                               (binopC op (parse l) (parse r))]
-    [(list 'ifleq0? n l r) (ifleq0? (parse n) (parse l) (parse r))]
-    [(list (? symbol? s) params ...) #:when (not (check-invalid-symbols (list s)))
-                                     (appC s
-                                           (for/list : (Listof ExprC) ([param params])
-                                             (parse param)))]
-    [_ (error 'DRMG "invalid syntax: ~e" s)]))
-
-;; Evaluates an ExprC using the supplied function definitions
-(define (interp [a : ExprC] [funs : (Listof fundefC)] [env : Environment]) : Real
-  (match a
-    [(numC n) n]
-    [(binopC op l r)
-     ((hash-ref ops op
-                (lambda () (error 'DRMG "unknown operator: ~e" op)))
-      (interp l funs env) (interp r funs env))]
-    [(ifleq0? n t f)
-     (if (<= (interp n funs env) 0)
-         (interp t funs env)
-         (interp f funs env))]
-    [(idC n) (lookup n env)]
-    [(appC n args)
-     (match (get-fundef n funs)
-       [(fundefC name params body)
-        (if (= (length params) (length args))
-            (interp
-             body
-             funs
-             (for/list : Environment ([param params] [arg args])
-               (Binding param (interp arg funs env))))
-            (error 'DRMG "wrong arity: ~e" a))])]))
-
-;; Parses a statment for bad syntax and returns a fundef if valid
-(define (parse-fundef [s : Sexp]) : fundefC
-  (match s
-    [(list (? symbol? n) (? symbol? l) ... '= e)
-     #:when (and
-             (not (check-duplicates l))
-             (not (check-invalid-symbols (cast l (Listof Symbol))))
-             (not (check-invalid-symbols (list n))))
-     (fundefC n (cast l (Listof Symbol)) (parse e))]
-    [_ (error 'DRMG "bad syntax: ~e" s)]))
-
-;; Checks if list has symbols that are reserved or are operators
+;; Returns true if the supplied list contains a reserved syntax word.
 (define (check-invalid-symbols [lst : (Listof Any)]) : Boolean
   (match lst
-    [(cons f r) #:when (or (set-member? reserved f) (hash-has-key? ops f)) #t]
-    [(cons f r) (check-invalid-symbols r)]
+    [(cons f r)
+     (if (set-member? reserved f) #t (check-invalid-symbols r))]
     ['() #f]))
 
-;; Parses a whole program and evaluates main
-(define (top-interp [s : Sexp]) : Real
-  (interp-fns (parse-prog s)))
+;; Looks up a name in an environment and reports an error when absent.
+(: lookup (-> Symbol Environment Value))
+(define (lookup name env)
+  (match env
+    ['() (error 'DRMG "unbound identifier ~e" name)]
+    [(cons (Binding n v) rest) (if (equal? n name) v (lookup name rest))]))
 
-;; Finds a function definition by name, or reports an undefined function
-(define (get-fundef [name : Symbol] [f : (Listof fundefC)]) : fundefC
-  (match f
-    ['() (error 'DRMG "undefined function: ~e" name)]
-    [(cons f r) (if (equal? name (fundefC-name f))
-                    f
-                    (get-fundef name r))]))
-
-;; Replaces occurrences of a parameter in an expression with a numeric value
-(define (subst [body : ExprC] [name : Symbol] [value : Real]) : ExprC
-  (match body
-    [(numC n) body]
-    [(idC n)
-     (if (equal? n name)
-         (numC value)
-         body)]
-    [(binopC op l r)
-     (binopC op (subst l name value) (subst r name value))]
-    [(ifleq0? n t f)
-     (ifleq0? (subst n name value)
-              (subst t name value)
-              (subst f name value))]
-    [(appC n params)
-     (appC n
-           (for/list : (Listof ExprC) ([param params])
-             (subst param name value)))]))
-
-;; Replaces each parameter in a body with its corresponding numeric value
-(define (subst-many [body : ExprC] [params : (Listof Symbol)] [values : (Listof Real)]) : ExprC
+;; Adds parameter/value bindings before a saved environment, preserving shadowing.
+(define (extend-env [params : (Listof Symbol)]
+                    [values : (Listof Value)]
+                    [env : Environment]) : Environment
   (match* (params values)
-    [('() '()) body]
-    [((cons p ps) (cons v vs))(subst-many (subst body p v) ps vs)]
-    [(_ _) (error 'DRMG "wrong arity: parameters ~e, values ~e, body ~e" params values body)]))
+    [('() '()) env]
+    [((cons p ps) (cons v vs))
+     (cons (Binding p v) (extend-env ps vs env))]
+    [(_ _) (error 'DRMG "wrong arity: parameters ~e, values ~e" params values)]))
 
-;; Parses a program and rejects duplicate function names
-(define (parse-prog [s : Sexp]) : (Listof fundefC)
+;; Parses DRMG4 syntax into its expression representation.
+(: parse (-> Sexp ExprC))
+(define (parse s)
   (match s
-    [(? list? l) (match (for/list : (Listof fundefC) ([f (cast l (Listof Sexp))])
-                          (parse-fundef f))
-                   [funs
-                    (if (check-duplicates (for/list : (Listof Symbol) ([f funs]) (fundefC-name f)))
-                        (error 'DRMG "bad syntax: duplicate function names in ~e" s)
-                        funs)])]
-    [_ (error 'DRMG "bad syntax: expected a list of function definitions: ~e" s)]))
+    [(? real? n) (NumC n)]
+    [(? string? str) (StrC str)]
+    [(? symbol? id)
+     (if (check-invalid-symbols (list id))
+         (error 'DRMG "reserved word used as identifier in ~e" s)
+         (IdC id))]
+    [(list 'if tst yes no) (IfC (parse tst) (parse yes) (parse no))]
+    [(list '% (? symbol? params) ... '-> body)
+     (define ps (cast params (Listof Symbol)))
+     (if (check-duplicates ps)
+         (error 'DRMG "duplicate function parameter in ~e" s)
+         (if (check-invalid-symbols ps)
+             (error 'DRMG "reserved function parameter in ~e" s)
+             (LamC ps (parse body))))]
+    [(list 'local bindings ... 'in body)
+     (define pairs : (Listof (Pairof Symbol ExprC))
+       (for/list : (Listof (Pairof Symbol ExprC)) ([b bindings])
+         (match b
+           [(list (? symbol? name) '= rhs)
+            (if (check-invalid-symbols (list name))
+                (error 'DRMG "reserved local name in ~e" s)
+                (cons name (parse (cast rhs Sexp))))]
+           [_ (error 'DRMG "malformed local binding in ~e" b)])))
+     (define names
+       (for/list : (Listof Symbol) ([pair pairs])
+         (match pair [(cons name rhs) name])))
+     ;; The binding values are already parsed; desugar directly into the AST.
+     (if (check-duplicates names)
+         (error 'DRMG "duplicate local name in ~e" s)
+         (AppC (LamC names (parse body))
+               (for/list : (Listof ExprC) ([pair pairs])
+                 (match pair [(cons name rhs) rhs]))))]
+    [(list f args ...)
+     (AppC (parse f)
+           (for/list : (Listof ExprC) ([arg args])
+             (parse arg)))]
+    [_ (error 'DRMG "invalid syntax in ~e" s)]))
 
-;; Evaluates a program by calling main with no arguments
-(define (interp-fns [funs : (Listof fundefC)]) : Real
-  (interp (appC 'main '()) funs '()))
+;; Serializes a value using the required DRMG4 representation.
+(: serialize (-> Value String))
+(define (serialize v)
+  (match v
+    [(NumV n) (~v n)]
+    [(BoolV #t) "true"]
+    [(BoolV #f) "false"]
+    [(StrV s) (~v s)]
+    [(ClosureV _ _ _) "#<procedure>"]
+    [(PrimV _) "#<primop>"]))
 
-;; Tests for sf
-(check-equal? (sf 8 4) 2)
-(check-equal? (sf 5 2) 5/2)
-(check-equal? (sf -8 4) -2)
-(check-exn #rx"division by zero" (lambda () (sf 1 0)))
-(check-exn #rx"division by zero" (lambda () (sf 1 0.0)))
+;; Retrieves a number from a value or raises a helpful DRMG error.
+(: expect-num (-> Value Symbol ExprC Real))
+(define (expect-num v op whole)
+  (match v [(NumV n) n] [_ (error 'DRMG "~a expected a number; received ~a in ~e" op (serialize v) whole)]))
 
-;; Tests for parse
-(check-equal? (parse '1) (numC 1))
-(check-equal? (parse '(+ 1 2)) (binopC '+ (numC 1) (numC 2)))
-(check-equal? (parse '(* 1 2)) (binopC '* (numC 1) (numC 2)))
-(check-equal? (parse '(* (+ 1 2) (* 3 4))) (binopC '* (binopC '+ (numC 1) (numC 2)) (binopC '* (numC 3) (numC 4))))
-(check-equal? (parse '(* (* (+ 1 2) (* 3 4)) 5))
-              (binopC '*
-                      (binopC '* (binopC '+ (numC 1) (numC 2))
-                              (binopC '* (numC 3) (numC 4)))
-                      (numC 5)))
-(check-equal? (parse 'a) (idC 'a))
-(check-exn #rx"invalid syntax: #t" (lambda () (parse #t)))
-(check-equal? (parse '(a))
-              (appC 'a '()))
-(check-equal? (parse '(a 1 2))
-              (appC 'a (list (numC 1) (numC 2))))
-(check-equal? (parse '(a b c))
-              (appC 'a (list (idC 'b) (idC 'c))))
-(check-equal? (parse '(a (+ 1 2) 3))
-              (appC 'a
-                    (list (binopC '+ (numC 1) (numC 2))
-                          (numC 3))))
-(check-exn #rx"invalid syntax" (lambda () (parse '(+ 1))))
-(check-exn #rx"invalid syntax" (lambda () (parse '(- 1 2 3))))
-(check-exn #rx"invalid syntax" (lambda () (parse '(*))))
-(check-exn #rx"invalid syntax" (lambda () (parse '(/ 1))))
-(check-exn #rx"invalid syntax" (lambda () (parse '(= 1 2))))
-(check-exn #rx"invalid syntax" (lambda () (parse '(ifleq0? 1 2))))
-(check-exn #rx"invalid syntax" (lambda () (parse '(ifleq0?))))
-(check-equal? (interp (parse '(a 1 2)) (list (parse-fundef '(a b c = (+ b c)))) '())3)
-(check-exn #rx"wrong arity" (lambda ()(interp (parse '(a 1)) (list (parse-fundef '(a b c = (+ b c)))) '())))
-(check-exn #rx"Binding 'a not found in environment: '()" (lambda () (interp (idC 'a) '() '())))
-(check-exn #rx"division by zero" (lambda () (interp (parse '(a (/ 1 0))) (list (parse-fundef '(a b = 2))) '())))
+;; Applies a primitive operator to already evaluated arguments.
+(: apply-prim (-> Symbol (Listof Value) ExprC Value))
+(define (apply-prim op vs whole)
+  (match* (op vs)
+    [((or '+ '- '* '/ '<=) (list left right))
+     (define a (expect-num left op whole))
+     (define b (expect-num right op whole))
+     (match op
+       ['+ (NumV (+ a b))]
+       ['- (NumV (- a b))]
+       ['* (NumV (* a b))]
+       ['/ (if (zero? b)
+               (error 'DRMG "division by zero in ~e" whole)
+               (NumV (/ a b)))]
+       [_ (BoolV (<= a b))])]
+    [('strlen (list (StrV s))) (NumV (string-length s))]
+    [('strlen (list _)) (error 'DRMG "strlen expected a string in ~e" whole)]
+    [('substring (list (StrV s) (NumV start) (NumV stop)))
+     (if (and (exact-nonnegative-integer? start)
+              (exact-nonnegative-integer? stop)
+              (<= start stop)
+              (<= stop (string-length s)))
+         (StrV (substring s start stop))
+         (error 'DRMG "substring indices must be natural, in range, and ordered in ~e" whole))]
+    [('substring (list _ _ _))
+     (error 'DRMG "substring expected a string and two natural indices in ~e" whole)]
+    [('equal? (list a b))
+     (BoolV (match* (a b)
+       [((NumV x) (NumV y)) (= x y)]
+       [((BoolV x) (BoolV y)) (equal? x y)]
+       [((StrV x) (StrV y)) (equal? x y)]
+       [(_ _) #f]))]
+    [('error (list v))
+     (error 'DRMG "user-error ~a in ~e" (serialize v) whole)]
+    [((or '+ '- '* '/ '<= 'strlen 'substring 'equal? 'error) _)
+     (error 'DRMG "wrong arity for ~a: received ~a arguments in ~e" op (length vs) whole)]
+    [(_ _) (error 'DRMG "unknown primitive ~e in ~e" op whole)]))
 
-;; Tests for interp
-(check-equal? (interp (numC 1) '() '()) 1)
-(check-equal? (interp (binopC '+ (numC 1) (numC 2)) '() '()) 3)
-(check-equal? (interp (binopC '- (numC 8) (numC 3)) '() '()) 5)
-(check-equal? (interp (binopC '* (numC 3) (numC 4)) '() '()) 12)
-(check-equal? (interp (binopC '/ (numC 8) (numC 4)) '() '()) 2)
-(check-equal? (interp (binopC '/ (numC 1) (numC 2)) '() '()) 1/2)
-(check-exn #rx"unknown operator: 'lebron" (lambda () (interp (binopC 'lebron (numC 2) (numC 3)) '() '())))
-(check-equal? (interp
-               (binopC '*
-                       (binopC '+ (numC 1) (numC 2))
-                       (binopC '+ (numC 3) (numC 4))) '() '()) 21)
-(check-equal? (interp (ifleq0? (numC 1) (numC 1) (numC 2)) '() '()) 2)
-(check-equal? (interp (ifleq0?
-                       (binopC '+ (numC 1) (numC 2))
-                               (numC 1)
-                               (numC 2)) '() '()) 2)
-(check-equal? (interp (ifleq0?
-                       (binopC '+ (numC 1) (numC 2))
-                       (numC 1)
-                       (binopC '+ (numC 1) (numC 2))) '() '()) 3)
-(check-equal? (interp (ifleq0?
-                       (binopC '- (numC 1) (numC 2))
-                       (binopC '+ (numC 1) (numC 2))
-                       (numC 1)) '() '()) 3)
+;; Evaluates an expression in an environment using eager application.
+(: interp (-> ExprC Environment Value))
+(define (interp e env)
+  (match e
+    [(NumC n) (NumV n)]
+    [(BoolC b) (BoolV b)]
+    [(StrC s) (StrV s)]
+    [(IdC name) (lookup name env)]
+    [(IfC tst yes no)
+     (match (interp tst env)
+       [(BoolV #t) (interp yes env)]
+       [(BoolV #f) (interp no env)]
+       [v (error 'DRMG "if test must be boolean; received ~a in ~e" (serialize v) e)])]
+    [(LamC ps body) (ClosureV ps body env)]
+    [(AppC f args)
+     (define fv (interp f env))
+     (define av
+       (for/list : (Listof Value) ([arg args])
+         (interp arg env)))
+     (match fv
+       [(ClosureV ps body saved)
+        (if (= (length ps) (length av))
+            (interp body (extend-env ps av saved))
+            (error 'DRMG "wrong arity: function expected ~a arguments, received ~a in ~e"
+                   (length ps) (length av) e))]
+       [(PrimV op) (apply-prim op av e)]
+       [_ (error 'DRMG "attempted to call a non-function value in ~e" e)])]))
 
-;; Tests for parse-fundef
-(check-equal? (parse-fundef '(a = 1))(fundefC 'a '() (numC 1)))
-(check-equal? (parse-fundef '(a b = 2)) (fundefC 'a '(b) (numC 2)))
-(check-equal? (parse-fundef '(a b c = 3)) (fundefC 'a '(b c) (numC 3)))
-(check-equal? (parse-fundef '(a b c = (+ 1 (* 2 3))))
-              (fundefC 'a '(b c) (binopC '+ (numC 1) (binopC '* (numC 2) (numC 3)))))
-(check-exn #rx"invalid syntax" (lambda () (parse-fundef '(a = (+ 1)))))
-(check-exn #rx"bad syntax" (lambda () (parse-fundef '(a b b = 1))))
-(check-exn #rx"bad syntax" (lambda () (parse-fundef '(a b c c = 1))))
-(check-exn #rx"bad syntax" (lambda () (parse-fundef '(a + = 1))))
-(check-exn #rx"bad syntax" (lambda () (parse-fundef '(a b ifleq0? = 1))))
-(check-exn #rx"bad syntax" (lambda () (parse-fundef '(1 = 2))))
-(check-exn #rx"bad syntax" (lambda () (parse-fundef '(a 1 = 2))))
-(check-exn #rx"bad syntax" (lambda () (parse-fundef '(a (b c) = 1))))
-(check-exn #rx"bad syntax" (lambda () (parse-fundef '(a b 1))))
-(check-exn #rx"bad syntax" (lambda () (parse-fundef '(a b =))))
-(check-exn #rx"bad syntax" (lambda () (parse-fundef '(a = 1 2))))
-(check-exn #rx"bad syntax" (lambda () (parse-fundef '())))
-(check-exn #rx"bad syntax" (lambda () (parse-fundef '(+ = 1))))
-(check-exn #rx"bad syntax" (lambda () (parse-fundef '(ifleq0? b = 1))))
+;; Provides primitive and boolean bindings for a top-level DRMG4 program.
+(: top-env Environment)
+(define top-env
+  (cons (Binding 'true (BoolV #t))
+        (cons (Binding 'false (BoolV #f))
+              (for/list : Environment ([n '(+ - * / <= substring strlen equal? error)])
+                (Binding n (PrimV n))))))
 
-;; Tests for check-invalid-symbols
+;; Parses, evaluates, and serializes one DRMG4 program expression.
+(: top-interp (-> Sexp String))
+(define (top-interp s) (serialize (interp (parse s) top-env)))
+
+;; Tests for identifier validation and environment extension.
 (check-equal? (check-invalid-symbols '()) #f)
-(check-equal? (check-invalid-symbols '(lebron)) #f)
-(check-equal? (check-invalid-symbols '(a b c)) #f)
-(check-equal? (check-invalid-symbols '(a b c +)) #t)
-(check-equal? (check-invalid-symbols '(a b ifleq0? c)) #t)
-(check-equal? (check-invalid-symbols '(a b = c +)) #t)
+(check-equal? (check-invalid-symbols '(+ true value)) #f)
+(check-equal? (check-invalid-symbols '(x if y)) #t)
+(check-equal? (lookup 'x (list (Binding 'x (NumV 4)))) (NumV 4))
+(check-exn #rx"DRMG.*unbound" (lambda () (lookup 'x '())))
+(check-equal? (extend-env '(x) (list (NumV 2)) (list (Binding 'x (NumV 10))))
+              (list (Binding 'x (NumV 2)) (Binding 'x (NumV 10))))
+(check-exn #rx"DRMG.*arity" (lambda () (extend-env '(x) '() '())))
+(check-exn #rx"DRMG.*arity" (lambda () (extend-env '() (list (NumV 2)) '())))
 
-;; Tests for top-interp
-(check-equal? (top-interp '((main = 1))) 1)
-(check-equal? (top-interp '((main = (+ 1 2)))) 3)
-(check-equal? (top-interp '((main = (* 1 2)))) 2)
-(check-equal? (top-interp '((main = (/ 1 1)))) 1)
-(check-equal? (top-interp '((main = (* (+ 1 2) (* 3 4))))) 36)
-(check-equal? (top-interp '((main = (/ (* (+ 1 2) (* 3 4)) 2)))) 18)
-(check-equal? (top-interp '((main = (ifleq0? 1 2 3)))) 3)
-(check-equal? (top-interp '((main = (ifleq0? (+ 1 2) 1 2)))) 2)
-(check-equal? (top-interp '((main = (ifleq0? (- 1 2) (+ 1 2) 2)))) 3)
-(check-equal? (top-interp '((a b c = (+ b c)) (main = (a 1 2)))) 3)
-(check-exn #rx"undefined function" (lambda () (top-interp '((a = 1)))))
-(check-exn #rx"wrong arity" (lambda () (top-interp '((main a = a)))))
+;; Tests parser support for literals, application, functions, and local desugaring.
+(check-equal? (parse 5) (NumC 5))
+(check-equal? (parse "hi") (StrC "hi"))
+(check-equal? (parse '(if true 1 2)) (IfC (IdC 'true) (NumC 1) (NumC 2)))
+(check-equal? (parse '((% x -> x) 4)) (AppC (LamC '(x) (IdC 'x)) (list (NumC 4))))
+(check-equal? (parse '(local [x = 2] [y = 3] in {+ x y}))
+              (AppC (LamC '(x y) (AppC (IdC '+) (list (IdC 'x) (IdC 'y)))) (list (NumC 2) (NumC 3))))
+(check-exn #rx"DRMG" (lambda () (parse '(% x x -> x))))
+(check-exn #rx"DRMG" (lambda () (parse '(if true 1))))
+(check-exn #rx"DRMG" (lambda () (parse '(% if -> 1))))
+(check-exn #rx"DRMG" (lambda () (parse '(% 3 -> 1))))
+(check-exn #rx"DRMG" (lambda () (parse '(local [x = 1] [x = 2] in x))))
+(check-exn #rx"DRMG" (lambda () (parse '(local [if = 1] in 2))))
+(check-exn #rx"DRMG" (lambda () (parse '(local [x 1] in x))))
 
-;; Tests for get-fundef
-(check-equal? (get-fundef 'a (list (fundefC 'a '() (numC 1)))) (fundefC 'a '() (numC 1)))
-(check-equal? (get-fundef 'b (list (fundefC 'a '() (numC 1)) (fundefC 'b '(c) (idC 'c)))) (fundefC 'b '(c) (idC 'c)))
-(check-exn #rx"undefined function" (lambda () (get-fundef 'a '())))
-(check-exn #rx"undefined function" (lambda () (get-fundef 'a (list (fundefC 'b '() (numC 2))))))
+;; Tests serialization across all value categories.
+(check-equal? (serialize (NumV 34)) "34")
+(check-equal? (serialize (BoolV #t)) "true")
+(check-equal? (serialize (BoolV #f)) "false")
+(check-equal? (serialize (StrV "hi")) "\"hi\"")
+(check-equal? (serialize (PrimV '+)) "#<primop>")
+(check-equal? (serialize (ClosureV '() (NumC 0) '())) "#<procedure>")
 
-;; Tests for subst
-(check-equal? (subst (numC 1) 'a 2) (numC 1))
-(check-equal? (subst (idC 'a) 'a 1) (numC 1))
-(check-equal? (subst (idC 'b) 'a 1) (idC 'b))
-(check-equal? (subst (binopC '+ (idC 'a) (numC 2)) 'a 1) (binopC '+ (numC 1) (numC 2)))
-(check-equal? (subst (ifleq0? (idC 'a) (idC 'a) (numC 2)) 'a 1) (ifleq0? (numC 1) (numC 1) (numC 2)))
-(check-equal? (subst (appC 'a (list (idC 'a) (idC 'b))) 'a 1) (appC 'a (list (numC 1) (idC 'b))))
+;; Tests top-level programs for primitives, closures, booleans, and strings.
+(check-equal? (top-interp '(+ 1 2)) "3")
+(check-equal? (top-interp '(if (<= 2 3) "yes" "no")) "\"yes\"")
+(check-equal? (top-interp '((% x -> (* x x)) 5)) "25")
+(check-equal? (top-interp '(local [x = 4] [y = 6] in (+ x y))) "10")
+(check-equal? (top-interp '(local in 7)) "7")
+;; A binding's right-hand side uses the outer environment, not a sibling binding.
+(check-equal? (top-interp '(local [x = 10] in
+                           (local [x = 2] [y = x] in (+ x y)))) "12")
+(check-equal? (top-interp '(substring "abcdef" 1 4)) "\"bcd\"")
+(check-equal? (top-interp '(strlen "abc")) "3")
+(check-equal? (top-interp '(equal? "abc" "abc")) "true")
+(check-equal? (top-interp '(equal? (% x -> x) (% x -> x))) "false")
+(check-exn #rx"DRMG" (lambda () (top-interp '(if 0 1 2))))
+(check-exn #rx"DRMG" (lambda () (top-interp '(+ 1 "x"))))
+(check-exn #rx"user-error" (lambda () (top-interp '(error "stop"))))
 
-;; Tests for subst-many
-(check-equal? (subst-many (numC 1) '() '()) (numC 1))
-(check-equal? (subst-many (idC 'a) '(a) '(1)) (numC 1))
-(check-equal? (subst-many (binopC '+ (idC 'a) (idC 'b)) '(a b) '(1 2))(binopC '+ (numC 1) (numC 2)))
-(check-exn #rx"wrong arity" (lambda ()(subst-many (idC 'a) '(a b) '(1))))
-(check-exn #rx"wrong arity" (lambda () (subst-many (idC 'a) '(a) '(1 2))))
+;; Tests that the refactored primitive dispatch keeps arity and type checks.
+(check-equal? (top-interp '(- 8 3)) "5")
+(check-equal? (top-interp '(/ 8 4)) "2")
+(check-equal? (top-interp '(<= 8 3)) "false")
+(check-equal? (top-interp '(equal? true false)) "false")
+(check-equal? (top-interp '(equal? + +)) "false")
+(check-equal? (top-interp '(substring "abc" 3 3)) "\"\"")
+(check-exn #rx"DRMG.*arity" (lambda () (top-interp '(+ 1))))
+(check-exn #rx"DRMG.*arity" (lambda () (top-interp '(strlen "a" "b"))))
+(check-exn #rx"DRMG.*arity" (lambda () (top-interp '(substring "abc" 1))))
+(check-exn #rx"DRMG.*arity" (lambda () (top-interp '(equal? 1))))
+(check-exn #rx"DRMG.*arity" (lambda () (top-interp '(error))))
+(check-exn #rx"DRMG.*string" (lambda () (top-interp '(strlen 3))))
+(check-exn #rx"DRMG.*string" (lambda () (top-interp '(substring 5 0 1))))
+(check-exn #rx"DRMG.*indices" (lambda () (top-interp '(substring "abc" 2 1))))
+(check-exn #rx"DRMG.*indices" (lambda () (top-interp '(substring "abc" 0 4))))
+(check-exn #rx"DRMG.*indices" (lambda () (top-interp '(substring "abc" -1 1))))
+(check-exn #rx"DRMG.*indices" (lambda () (top-interp '(substring "abc" 1/2 1))))
+(check-exn #rx"DRMG.*zero" (lambda () (top-interp '(/ 1 0))))
 
-;; Tests for parse-prog
-(check-equal? (parse-prog '()) '())
-(check-equal? (parse-prog '((a = 1))) (list (fundefC 'a '() (numC 1))))
-(check-equal? (parse-prog '((a = 1) (b c = c))) (list (fundefC 'a '() (numC 1)) (fundefC 'b '(c) (idC 'c))))
-(check-exn #rx"duplicate function names" (lambda () (parse-prog '((a = 1) (a = 2)))))
-(check-exn #rx"bad syntax" (lambda () (parse-prog 'a)))
-(check-exn #rx"bad syntax" (lambda () (parse-prog '((a b b = 1)))))
-
-;; Tests for interp-fns
-(check-equal? (interp-fns (list (fundefC 'main '() (numC 1)))) 1)
-(check-exn #rx"undefined function" (lambda () (interp-fns '())))
-(check-exn #rx"wrong arity" (lambda () (interp-fns (list (fundefC 'main '(a) (numC 1))))))
-
-;; Tests for lookup
-(check-equal? (lookup 'x (list (Binding 'x 10))) 10)
-(check-equal? (lookup 'y (list (Binding 'x 10) (Binding 'y 20))) 20)
-(check-exn #rx"Binding 'z not found in environment: '()" (lambda () (lookup 'z '())))
+;; Tests closure capture, primitive shadowing, and eager argument evaluation.
+(check-equal?
+ (top-interp '(local [x = 10] in
+                (local [f = (% y -> (+ x y))] in
+                  (local [x = 100] in (f 2)))))
+ "12")
+(check-equal? (top-interp '((% + -> (+ 7 2)) -)) "5")
+(check-equal? (top-interp '((% -> 9))) "9")
+(check-exn #rx"DRMG.*arity" (lambda () (top-interp '((% x -> x) 1 2))))
+(check-exn #rx"DRMG.*zero" (lambda () (top-interp '((% x -> 7) (/ 1 0)))))
