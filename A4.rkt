@@ -37,7 +37,7 @@
 (: lookup (-> Symbol Environment Value))
 (define (lookup name env)
   (match env
-    ['() (error 'DRMG "unbound identifier ~e" name)]
+    ['() (error 'DRMG "unbound identifier: ~e" name)]
     [(cons (Binding n v) rest) (if (equal? n name) v (lookup name rest))]))
 
 ;; Adds parameter/value bindings before a saved environment, preserving shadowing.
@@ -186,6 +186,7 @@
 (: top-interp (-> Sexp String))
 (define (top-interp s) (serialize (interp (parse s) top-env)))
 
+
 ;; Tests for identifier validation and environment extension.
 (check-equal? (check-invalid-symbols '()) #f)
 (check-equal? (check-invalid-symbols '(+ true value)) #f)
@@ -211,6 +212,8 @@
 (check-exn #rx"DRMG" (lambda () (parse '(local [x = 1] [x = 2] in x))))
 (check-exn #rx"DRMG" (lambda () (parse '(local [if = 1] in 2))))
 (check-exn #rx"DRMG" (lambda () (parse '(local [x 1] in x))))
+(check-exn #rx"DRMG" (lambda () (parse #t)))
+(check-exn #rx"DRMG" (lambda () (parse '())))
 
 ;; Tests serialization across all value categories.
 (check-equal? (serialize (NumV 34)) "34")
@@ -221,29 +224,46 @@
 (check-equal? (serialize (ClosureV '() (NumC 0) '())) "#<procedure>")
 
 ;; Tests top-level programs for primitives, closures, booleans, and strings.
+(check-equal? (interp (BoolC #t) top-env) (BoolV #t))
+(check-equal? (interp (BoolC #f) top-env) (BoolV #f))
 (check-equal? (top-interp '(+ 1 2)) "3")
 (check-equal? (top-interp '(if (<= 2 3) "yes" "no")) "\"yes\"")
 (check-equal? (top-interp '((% x -> (* x x)) 5)) "25")
 (check-equal? (top-interp '(local [x = 4] [y = 6] in (+ x y))) "10")
 (check-equal? (top-interp '(local in 7)) "7")
+
 ;; A binding's right-hand side uses the outer environment, not a sibling binding.
 (check-equal? (top-interp '(local [x = 10] in
                            (local [x = 2] [y = x] in (+ x y)))) "12")
 (check-equal? (top-interp '(substring "abcdef" 1 4)) "\"bcd\"")
+(check-equal? (top-interp '(substring "hello" 0 5)) "\"hello\"")
 (check-equal? (top-interp '(strlen "abc")) "3")
+(check-equal? (top-interp '(strlen "")) "0")
 (check-equal? (top-interp '(equal? "abc" "abc")) "true")
 (check-equal? (top-interp '(equal? (% x -> x) (% x -> x))) "false")
 (check-exn #rx"DRMG" (lambda () (top-interp '(if 0 1 2))))
+(check-exn #rx"DRMG" (lambda () (top-interp '(if "hello" 1 2))))
 (check-exn #rx"DRMG" (lambda () (top-interp '(+ 1 "x"))))
 (check-exn #rx"user-error" (lambda () (top-interp '(error "stop"))))
+(check-exn #rx"user-error.*\"hello\""
+           (lambda () (top-interp '(error "hello"))))
+(check-exn #rx"DRMG.*unbound" (lambda () (top-interp 'x)))
+(check-equal? (top-interp '+) "#<primop>")
+(check-equal? (top-interp '(% x -> x)) "#<procedure>")
+(check-equal? (top-interp '(% -> 5)) "#<procedure>")
 
 ;; Tests that the refactored primitive dispatch keeps arity and type checks.
 (check-equal? (top-interp '(- 8 3)) "5")
 (check-equal? (top-interp '(/ 8 4)) "2")
 (check-equal? (top-interp '(<= 8 3)) "false")
 (check-equal? (top-interp '(equal? true false)) "false")
+(check-equal? (top-interp '(equal? true true)) "true")
 (check-equal? (top-interp '(equal? + +)) "false")
+(check-equal? (top-interp '(equal? 1 "1")) "false")
+(check-equal? (top-interp '(equal? 1 1.0)) "true")
 (check-equal? (top-interp '(substring "abc" 3 3)) "\"\"")
+(check-equal? (top-interp '(equal? 3 3)) "true")
+(check-equal? (top-interp '(equal? 3 4)) "false")
 (check-exn #rx"DRMG.*arity" (lambda () (top-interp '(+ 1))))
 (check-exn #rx"DRMG.*arity" (lambda () (top-interp '(strlen "a" "b"))))
 (check-exn #rx"DRMG.*arity" (lambda () (top-interp '(substring "abc" 1))))
@@ -265,5 +285,55 @@
  "12")
 (check-equal? (top-interp '((% + -> (+ 7 2)) -)) "5")
 (check-equal? (top-interp '((% -> 9))) "9")
+(check-equal? (top-interp '(if true 10 (/ 1 0))) "10")
+(check-equal? (top-interp '(if false (/ 1 0) 20)) "20")
+(check-equal? (top-interp '(((% x -> (% y -> (+ x y))) 10) 5)) "15")
+(check-equal? (top-interp
+               '(local [x = 10] in
+                  (local [f = (% y -> (+ x y))] in
+                    (local [x = 100] in
+                      (f 5)))))
+              "15")
+(check-equal? (top-interp
+               '(local [x = 10] in
+                  (local [f = (% y -> (+ x y))] in
+                    (local [x = 100] in
+                      (f x))))) "110")
+(check-equal? (top-interp
+               '(local [operation = +] in
+                  (operation 10 20)))
+              "30")
+(check-equal? (top-interp
+               '(local [+ = *] in
+                  (+ 3 4)))
+              "12")
+(check-equal? (top-interp
+               '(local [op = +] in
+                  (local [+ = *] in
+                    (op 3 4))))
+              "7")
+(check-equal? (top-interp
+               '((% f -> (f 3))
+                 (% x -> (+ x 1))))
+              "4")
+(check-equal? (top-interp
+               '(local [true = false] in
+                  (if true 1 2)))
+              "2")
+(check-equal? (top-interp
+               '(local [f = (% x -> x)] in
+                  (equal? f f)))
+              "false")
 (check-exn #rx"DRMG.*arity" (lambda () (top-interp '((% x -> x) 1 2))))
 (check-exn #rx"DRMG.*zero" (lambda () (top-interp '((% x -> 7) (/ 1 0)))))
+(check-exn #rx"DRMG.*zero" (lambda () (top-interp '((% x y -> x) 10 (/ 1 0)))))
+(check-exn #rx"DRMG" (lambda () (top-interp '((% f -> (f 3)) 10))))
+(check-exn #rx"DRMG.*non-function" (lambda () (top-interp '(3 4))))
+(check-exn #rx"DRMG.*unbound"
+           (lambda ()
+             (top-interp
+              '(local [x = 3] [y = x] in y))))
+(check-exn #rx"DRMG.*unknown primitive"
+           (lambda ()
+             (apply-prim 'unknown '() (NumC 0))))
+
