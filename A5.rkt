@@ -106,7 +106,16 @@
 ;; Retrieves a number from a value or raises a helpful DRMG error.
 (: expect-num (-> Value Symbol ExprC Real))
 (define (expect-num v op whole)
-  (match v [(NumV n) n] [_ (error 'DRMG "~a expected a number; received ~a in ~e" op (serialize v) whole)]))
+  (match v
+    [(NumV n) n]
+    [_ (error 'DRMG "~a expected a number; received ~a in ~e" op (serialize v) whole)]))
+
+;; Converts a DRMG value to a string for concatenation, without adding quotes to strings.
+(: value->string (-> Value String))
+(define (value->string v)
+  (match v
+    [(StrV s) s]
+    [_ (serialize v)]))
 
 ;; Applies a primitive operator to already evaluated arguments.
 (: apply-prim (-> Symbol (Listof Value) ExprC Value))
@@ -140,9 +149,37 @@
        [((BoolV x) (BoolV y)) (equal? x y)]
        [((StrV x) (StrV y)) (equal? x y)]
        [(_ _) #f]))]
+    [('println (list (StrV s)))
+     (begin
+       (displayln s)
+       (BoolV #t))]
+    [('println (list _))
+     (error 'DRMG "println expected a string in ~e" whole)]
+    [('read-num '())
+     (display ">")
+     (match (read-line)
+       [(? string? s)
+        (match (string->number s)
+          [(? real? n) (NumV n)]
+          [_ (error 'DRMG "read-num expected a real number, got ~e in ~e" s whole)])]
+       [_ (error 'DRMG "read-num reached end of input in ~e" whole)])]
+    [('read-str '())
+     (display ">")
+     (match (read-line)
+       [(? string? s) (StrV s)]
+       [_ (error 'DRMG "read-str reached end of input in ~e" whole)])]
+    [('begin vs)
+     (if (not (empty? vs))
+         (last vs)
+         (error 'DRMG "begin expects at least one expression in ~e" whole))]
+    [('++ vs)
+     (if (not (empty? vs))
+         (StrV (apply string-append (map value->string vs)))
+         (error 'DRMG "++ expects at least one argument in ~e" whole))]
     [('error (list v))
      (error 'DRMG "user-error ~a in ~e" (serialize v) whole)]
-    [((or '+ '- '* '/ '<= 'strlen 'substring 'equal? 'error) _)
+    [((or '+ '- '* '/ '<= 'strlen 'substring 'equal? 'error
+          'println 'read-num 'read-str) _)
      (error 'DRMG "wrong arity for ~a: received ~a arguments in ~e" op (length vs) whole)]
     [(_ _) (error 'DRMG "unknown primitive ~e in ~e" op whole)]))
 
@@ -179,7 +216,8 @@
 (define top-env
   (cons (Binding 'true (BoolV #t))
         (cons (Binding 'false (BoolV #f))
-              (for/list : Environment ([n '(+ - * / <= substring strlen equal? error)])
+              (for/list : Environment ([n '(+ - * / <= substring strlen equal? error
+                                              println read-num read-str begin ++)])
                 (Binding n (PrimV n))))))
 
 ;; Parses, evaluates, and serializes one DRMG4 program expression.
@@ -337,3 +375,60 @@
            (lambda ()
              (apply-prim 'unknown '() (NumC 0))))
 
+;; Tests DRMG5 primitives and variable arity.
+(check-equal? (top-interp '(begin 1 2 3)) "3")
+(check-equal? (top-interp '(begin 42)) "42")
+(check-equal? (top-interp '(++ "Hello " 5)) "\"Hello 5\"")
+(check-equal? (top-interp '(++ "a" "b" "c")) "\"abc\"")
+(check-equal? (top-interp '(++ 1 2 3)) "\"123\"")
+(check-exn #rx"DRMG" (lambda () (top-interp '(begin))))
+(check-exn #rx"DRMG" (lambda () (top-interp '(++))))
+(check-exn #rx"DRMG" (lambda () (top-interp '(println 5))))
+(check-exn #rx"DRMG" (lambda () (top-interp '(read-num 1))))
+(check-exn #rx"DRMG" (lambda () (top-interp '(read-str 1))))
+(check-equal?
+ (with-output-to-string
+   (lambda () (top-interp '(println "Hello"))))
+ "Hello\n")
+(check-exn #rx"DRMG.*string"(lambda () (top-interp '(println 5))))
+
+;; Tests input primitives without requiring interactive input.
+(check-equal?
+ (parameterize ([current-input-port (open-input-string "42\n")]
+                [current-output-port (open-output-string)])
+   (top-interp '(read-num)))
+ "42")
+(check-equal?
+ (parameterize ([current-input-port (open-input-string "hello world\n")]
+                [current-output-port (open-output-string)])
+   (top-interp '(read-str)))
+ "\"hello world\"")
+(check-exn
+ #rx"DRMG"
+ (lambda ()
+   (parameterize ([current-input-port (open-input-string "abc\n")]
+                  [current-output-port (open-output-string)])
+     (top-interp '(read-num)))))
+(check-equal?
+ (parameterize ([current-input-port (open-input-string "42\n")])
+   (top-interp '(read-num)))
+ "42")
+(check-exn
+ #rx"DRMG.*real number"
+ (lambda ()
+   (parameterize ([current-input-port (open-input-string "abc\n")])
+     (top-interp '(read-num)))))
+(check-exn
+ #rx"DRMG.*end of input"
+ (lambda ()
+   (parameterize ([current-input-port (open-input-string "")])
+     (top-interp '(read-num)))))
+(check-equal?
+ (parameterize ([current-input-port (open-input-string "Hello world\n")])
+   (top-interp '(read-str)))
+ "\"Hello world\"")
+(check-exn
+ #rx"DRMG.*end of input"
+ (lambda ()
+   (parameterize ([current-input-port (open-input-string "")])
+     (top-interp '(read-str)))))
