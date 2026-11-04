@@ -2,8 +2,8 @@
 
 (require typed/rackunit)
 
-;; Progress: Implements DRMG4 parsing, environments, closures, primitives,
-;; booleans, strings, conditionals, local desugaring, serialization, and tests.
+;; Progress: DRMG5 primitives and tests implemented, with an example program.
+;; Runtime verification was not available in this environment.
 
 (define-type ExprC (U NumC BoolC StrC IdC IfC LamC AppC))
 (struct NumC ([n : Real]) #:transparent)
@@ -24,7 +24,7 @@
 (define-type Environment (Listof Binding))
 
 ;; Reserved syntax words cannot be used as identifiers; primitive names can.
-(define reserved (set 'if '= 'local '% '-> 'in))
+(define reserved (set 'if '= 'local '% '-> 'in 'do))
 
 ;; Returns true if the supplied list contains a reserved syntax word.
 (define (check-invalid-symbols [lst : (Listof Any)]) : Boolean
@@ -68,7 +68,7 @@
          (if (check-invalid-symbols ps)
              (error 'DRMG "reserved function parameter in ~e" s)
              (LamC ps (parse body))))]
-    [(list 'local bindings ... 'in body)
+    [(list 'local bindings ... (or 'in 'do) body)
      (define pairs : (Listof (Pairof Symbol ExprC))
        (for/list : (Listof (Pairof Symbol ExprC)) ([b bindings])
          (match b
@@ -269,6 +269,7 @@
 (check-equal? (top-interp '((% x -> (* x x)) 5)) "25")
 (check-equal? (top-interp '(local [x = 4] [y = 6] in (+ x y))) "10")
 (check-equal? (top-interp '(local in 7)) "7")
+(check-equal? (top-interp '(local [x = 7] do (+ x 5))) "12")
 
 ;; A binding's right-hand side uses the outer environment, not a sibling binding.
 (check-equal? (top-interp '(local [x = 10] in
@@ -432,3 +433,12 @@
  (lambda ()
    (parameterize ([current-input-port (open-input-string "")])
      (top-interp '(read-str)))))
+
+;; An interactive DRMG5 program that asks for a number and doubles it.
+(define example-program : Sexp
+  '{begin
+     {println "Welcome to the doubling machine."}
+     {println "Enter a number."}
+     {local [n = {read-num}]
+       in
+       {println {++ "Twice that number is " {* n 2} "."}}}})
