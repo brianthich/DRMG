@@ -337,7 +337,7 @@
 (define top-env
   (for/list : Environment
     ([n '(true false + - * / <= substring strlen equal? error
-                make-array array aref aset!)]
+               make-array array aref aset!)]
      [i (in-range 1 16)])
     (define loc (natural-index i))
     (if loc
@@ -353,10 +353,10 @@
 ;; A local binding sequences each body call before the next recursive call.
 (define while : Sexp
   '{rocal [loop = {% guard body ->
-                    {if {guard}
-                        {local [unused = {body}] in {loop guard body}}
-                        false}}]
-     in loop})
+                     {if {guard}
+                         {local [unused = {body}] in {loop guard body}}
+                         false}}]
+          in loop})
 
 ;; DRMG6 function: checks whether the given array's size elements strictly increase.
 ;; The surrounding DRMG6 environment must bind while to the expression above.
@@ -364,11 +364,11 @@
   '{% a size ->
       {local [i = 1] [ordered = true] in
         {local [unused =
-                 {while
-                  {% -> {if ordered {<= {+ i 1} size} false}}
-                  {% -> {if {<= {aref a i} {aref a {- i 1}}}
-                            {ordered := false}
-                            {i := {+ i 1}}}}}]
+                       {while
+                        {% -> {if ordered {<= {+ i 1} size} false}}
+                        {% -> {if {<= {aref a i} {aref a {- i 1}}}
+                                  {ordered := false}
+                                  {i := {+ i 1}}}}}]
           in ordered}}})
 
 
@@ -436,7 +436,7 @@
 
 ;; A binding's right-hand side uses the outer environment, not a sibling binding.
 (check-equal? (top-interp '(local [x = 10] in
-                           (local [x = 2] [y = x] in (+ x y))) 1000) "12")
+                             (local [x = 2] [y = x] in (+ x y))) 1000) "12")
 (check-equal? (top-interp '(substring "abcdef" 1 4) 1000) "\"bcd\"")
 (check-equal? (top-interp '(substring "hello" 0 5) 1000) "\"hello\"")
 (check-equal? (top-interp '(strlen "abc") 1000) "3")
@@ -756,13 +756,13 @@
 ;; Tests recursive closure creation and calling the resulting function.
 (check-equal?
  (top-interp '(rocal [fact = (% n ->
-                              (if (<= n 1) 1 (* n (fact (- n 1)))))]
-                    in (fact 5)) 100)
+                                (if (<= n 1) 1 (* n (fact (- n 1)))))]
+                     in (fact 5)) 100)
  "120")
 (check-equal?
  (top-interp '(rocal [fact = (% n ->
-                              (if (<= n 1) 1 (* n (fact (- n 1)))))]
-                    in (fact 0)) 40)
+                                (if (<= n 1) 1 (* n (fact (- n 1)))))]
+                     in (fact 0)) 40)
  "1")
 (check-equal?
  (top-interp '(local [f = 99] in
@@ -771,8 +771,8 @@
  "3")
 (check-equal?
  (top-interp '((rocal [f = (% n ->
-                            (if (<= n 0) 0 (+ 1 (f (- n 1)))))]
-                     in f) 4) 100)
+                              (if (<= n 0) 0 (+ 1 (f (- n 1)))))]
+                      in f) 4) 100)
  "4")
 (check-exn #rx"DRMG.*out of memory"
            (lambda () (top-interp '(rocal [f = (% -> 1)] in f) 16)))
@@ -817,7 +817,7 @@
   (list 'local (list 'while '= while) 'in
         '(local [x = 0] in
            (local [unused = (while (% -> (<= x 3))
-                                  (% -> (x := (+ x 1))))] in x)))
+                                   (% -> (x := (+ x 1))))] in x)))
   100)
  "4")
 
@@ -846,3 +846,48 @@
  (top-interp (list 'local (list 'while '= while) 'in
                    (list in-order '(array -3 -1 1/2 2.5) 4)) 200)
  "true")
+(check-equal?
+ (top-interp
+  '(local [unused = (true := false)] in
+     (if true 1 2)) 40)
+ "2")
+(check-equal?
+ (top-interp
+  '(local [a = (array 1)] [b = (array 1)] in
+     (equal? a b)) 40)
+ "false")
+(check-equal?
+ (top-interp
+  '(local [a = (array 1)] in
+     (local [b = a] in
+       (local [unused = (aset! b 0 8)] in
+         (aref a 0)))) 40)
+ "8")
+(check-equal?
+ (top-interp
+  '((rocal [f = (% n ->
+                   (if (<= n 0) 0 (+ 1 (f (- n 1)))))]
+           in f) 5) 100)
+ "5")
+(check-equal?
+ (top-interp '(aref (make-array 1 42) 0) 17)
+ "42")
+(define invalid-pointer-sto : Store (make-initial-store 20))
+(vector-set! invalid-pointer-sto 0 (NumV 5))
+(check-exn #rx"DRMG.*invalid store allocation pointer"
+           (lambda ()
+             (allocate invalid-pointer-sto 1)))
+(check-equal? (serialize (StrV "a\rb")) "\"a\\rb\"")
+(check-equal? (serialize (StrV "a\ab")) "\"a\\ab\"")
+(check-equal? (serialize (StrV "a\bb")) "\"a\\bb\"")
+(check-equal? (serialize (StrV "a\vb")) "\"a\\vb\"")
+(check-equal? (serialize (StrV "a\fb")) "\"a\\fb\"")
+(check-exn #rx"DRMG.*unbound"
+           (lambda () (top-interp 'missing 30)))
+(check-exn #rx"DRMG.*out of memory"
+           (lambda () (top-interp '(make-array 6 0) 20)))
+(check-exn #rx"DRMG.*out of memory"
+           (lambda () (top-interp '(make-array 1 0) 15)))
+(check-exn #rx"DRMG.*allocation pointer"
+           (lambda ()
+             (read-store (make-initial-store 20) 0)))
