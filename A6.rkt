@@ -2,11 +2,10 @@
 
 (require typed/rackunit)
 
-;; Progress: Implemented mutable store, memory allocation, arrays, array primitives,
-;; location-based environments, NullV, and array identity equality.
-;; Remaining: binding mutation (:=), recursive bindings (rocal), while, and in-order.
+;; Progress: Required DRMG6 features implemented, including :=, rocal,
+;; while, and in-order. Optional quicksort is not included.
 
-(define-type ExprC (U NumC BoolC StrC IdC IfC LamC AppC))
+(define-type ExprC (U NumC BoolC StrC IdC IfC LamC AppC SetC RecC))
 (struct NumC ([n : Real]) #:transparent)
 (struct BoolC ([b : Boolean]) #:transparent)
 (struct StrC ([s : String]) #:transparent)
@@ -14,6 +13,8 @@
 (struct IfC ([test : ExprC] [yes : ExprC] [no : ExprC]) #:transparent)
 (struct LamC ([params : (Listof Symbol)] [body : ExprC]) #:transparent)
 (struct AppC ([fun : ExprC] [args : (Listof ExprC)]) #:transparent)
+(struct SetC ([name : Symbol] [rhs : ExprC]) #:transparent)
+(struct RecC ([name : Symbol] [rhs : ExprC] [body : ExprC]) #:transparent)
 
 (define-type Value (U NumV BoolV StrV ClosureV PrimV ArrayV NullV))
 (struct NumV ([n : Real]) #:transparent)
@@ -29,31 +30,44 @@
 (define-type Store (Vectorof (U Natural Value)))
 
 ;; Reserved syntax words cannot be used as identifiers; primitive names can.
-(define reserved (set 'if '= 'local '% '-> 'in))
+(define reserved (set 'if '= 'local 'rocal '% '-> 'in))
+
+;; Returns n as a natural number, or false if it is inexact, fractional, or negative.
+(: natural-index (-> Real (U Natural False)))
+(define (natural-index n)
+  (if (and (integer? n) (exact? n) (<= 0 n)) n #f))
+
+;; Reads a stored DRMG value; the raw allocation pointer is not a DRMG value.
+(: read-store (-> Store Natural Value))
+(define (read-store sto loc)
+  (define v (vector-ref sto loc))
+  (if (real? v)
+      (error 'DRMG "cannot read allocation pointer as a value at location ~a" loc)
+      v))
 
 ;; Creates a store containing the top-level bindings and allocation pointer.
 (: make-initial-store (-> Natural Store))
 (define (make-initial-store memsize)
-  (if (< memsize (+ 1 (length top-env)))
-      (error 'DRMG "out of memory: need at least ~a cells, received ~a"
-             (+ 1 (length top-env)) memsize)
-      (let ([sto (make-vector memsize (ann (NumV 0) (U Natural Value)))])
-        (vector-set! sto 0 (+ 1 (length top-env)))
-        (for ([b top-env])
-          (match b
-            [(Binding 'true loc)
-             (vector-set! sto loc (BoolV #t))]
-            [(Binding 'false loc)
-             (vector-set! sto loc (BoolV #f))]
-            [(Binding name loc)
-             (vector-set! sto loc (PrimV name))]))
-        sto)))
+  (define checked-size
+    (if (< memsize (+ 1 (length top-env)))
+        (error 'DRMG "out of memory: need at least ~a cells, received ~a"
+               (+ 1 (length top-env)) memsize)
+        memsize))
+  (define blank : (U Natural Value) (NumV 0))
+  (define sto : Store (make-vector checked-size blank))
+  (vector-set! sto 0 (+ 1 (length top-env)))
+  (for ([b top-env])
+    (match b
+      [(Binding 'true loc) (vector-set! sto loc (BoolV #t))]
+      [(Binding 'false loc) (vector-set! sto loc (BoolV #f))]
+      [(Binding name loc) (vector-set! sto loc (PrimV name))]))
+  sto)
 
 ;; Reserves count consecutive store cells and returns their starting location.
 (: allocate (-> Store Natural Natural))
 (define (allocate sto count)
   (define next (vector-ref sto 0))
-  (if (exact-nonnegative-integer? next)
+  (if (real? next)
       (if (<= (+ next count) (vector-length sto))
           (begin
             (vector-set! sto 0 (+ next count))
@@ -94,9 +108,15 @@
      (error 'DRMG "wrong arity: parameters ~e, values ~e"
             params values)]))
 
-;; Parses DRMG4 syntax into its expression representation.
+;; Parses DRMG6 syntax into its expression representation.
 (: parse (-> Sexp ExprC))
 (define (parse s)
+  (parse-expr s))
+
+;; Validates and parses a value from a match pattern; malformed syntax raises DRMG.
+;; Nested repeated patterns may infer Any, so this helper checks the syntax itself.
+(: parse-expr (-> Any ExprC))
+(define (parse-expr s)
   (match s
     [(? real? n) (NumC n)]
     [(? string? str) (StrC str)]
@@ -104,14 +124,19 @@
      (if (check-invalid-symbols (list id))
          (error 'DRMG "reserved word used as identifier in ~e" s)
          (IdC id))]
-    [(list 'if tst yes no) (IfC (parse tst) (parse yes) (parse no))]
-    [(list '% (? symbol? params) ... '-> body)
-     (define ps (cast params (Listof Symbol)))
+    [(list 'if tst yes no)
+     (IfC (parse-expr tst) (parse-expr yes) (parse-expr no))]
+    [(list '% params ... '-> body)
+     (define ps : (Listof Symbol)
+       (for/list : (Listof Symbol) ([p params])
+         (if (symbol? p)
+             p
+             (error 'DRMG "function parameter must be a symbol in ~e" s))))
      (if (check-duplicates ps)
          (error 'DRMG "duplicate function parameter in ~e" s)
          (if (check-invalid-symbols ps)
              (error 'DRMG "reserved function parameter in ~e" s)
-             (LamC ps (parse body))))]
+             (LamC ps (parse-expr body))))]
     [(list 'local bindings ... 'in body)
      (define pairs : (Listof (Pairof Symbol ExprC))
        (for/list : (Listof (Pairof Symbol ExprC)) ([b bindings])
@@ -119,7 +144,7 @@
            [(list (? symbol? name) '= rhs)
             (if (check-invalid-symbols (list name))
                 (error 'DRMG "reserved local name in ~e" s)
-                (cons name (parse (cast rhs Sexp))))]
+                (cons name (parse-expr rhs)))]
            [_ (error 'DRMG "malformed local binding in ~e" b)])))
      (define names
        (for/list : (Listof Symbol) ([pair pairs])
@@ -127,23 +152,55 @@
      ;; The binding values are already parsed; desugar directly into the AST.
      (if (check-duplicates names)
          (error 'DRMG "duplicate local name in ~e" s)
-         (AppC (LamC names (parse body))
+         (AppC (LamC names (parse-expr body))
                (for/list : (Listof ExprC) ([pair pairs])
                  (match pair [(cons name rhs) rhs]))))]
+    [(list (? symbol? name) ':= rhs)
+     (if (check-invalid-symbols (list name))
+         (error 'DRMG "reserved assignment target in ~e" s)
+         (SetC name (parse-expr rhs)))]
+    [(list _ ':= _ ...)
+     (error 'DRMG "assignment requires a name and one expression in ~e" s)]
+    [(list 'rocal (list (? symbol? name) '= rhs) 'in body)
+     (if (check-invalid-symbols (list name))
+         (error 'DRMG "reserved recursive binding name in ~e" s)
+         (RecC name (parse-expr rhs) (parse-expr body)))]
+    [(list 'rocal _ ...)
+     (error 'DRMG "rocal requires one [name = expression] binding and a body in ~e" s)]
     [(list f args ...)
-     (AppC (parse f)
+     (AppC (parse-expr f)
            (for/list : (Listof ExprC) ([arg args])
-             (parse arg)))]
+             (parse-expr arg)))]
     [_ (error 'DRMG "invalid syntax in ~e" s)]))
+
+;; Escapes the remaining string characters and appends the closing quotation mark.
+;; string-append is needed to assemble the quoted result without format or ~v.
+(: quote-string-rest (-> String Natural String))
+(define (quote-string-rest s pos)
+  (if (= pos (string-length s))
+      "\""
+      (string-append
+       (match (substring s pos (+ pos 1))
+         ["\"" "\\\""]
+         ["\\" "\\\\"]
+         ["\n" "\\n"]
+         ["\r" "\\r"]
+         ["\t" "\\t"]
+         ["\a" "\\a"]
+         ["\b" "\\b"]
+         ["\v" "\\v"]
+         ["\f" "\\f"]
+         [other other])
+       (quote-string-rest s (+ pos 1)))))
 
 ;; Serializes a DRMG value into its string representation.
 (: serialize (-> Value String))
 (define (serialize v)
   (match v
-    [(NumV n) (~v n)]
+    [(NumV n) (number->string n)]
     [(BoolV #t) "true"]
     [(BoolV #f) "false"]
-    [(StrV s) (~v s)]
+    [(StrV s) (string-append "\"" (quote-string-rest s 0))]
     [(ClosureV _ _ _) "#<procedure>"]
     [(PrimV _) "#<primop>"]
     [(ArrayV _ _) "#<array>"]
@@ -174,11 +231,10 @@
     [('strlen (list _))
      (error 'DRMG "strlen expected a string in ~e" whole)]
     [('substring (list (StrV s) (NumV start) (NumV stop)))
-     (if (and (exact-nonnegative-integer? start)
-              (exact-nonnegative-integer? stop)
-              (<= start stop)
-              (<= stop (string-length s)))
-         (StrV (substring s start stop))
+     (define a (natural-index start))
+     (define b (natural-index stop))
+     (if (and a b (<= a b) (<= b (string-length s)))
+         (StrV (substring s a b))
          (error 'DRMG "substring indices must be natural, in range, and ordered in ~e" whole))]
     [('substring (list _ _ _))
      (error 'DRMG "substring expected a string and two natural indices in ~e" whole)]
@@ -191,26 +247,31 @@
               [((NullV) (NullV)) #t]
               [(_ _) #f]))]
     [('make-array (list (NumV size) init))
-     (if (and (exact-nonnegative-integer? size) (> size 0))
-         (let ([base (allocate sto size)])
-           (for ([i (in-range size)])
-             (vector-set! sto (+ base i) init))
-           (ArrayV base size))
-         (error 'DRMG "make-array requires a positive integer size in ~e" whole))]
+     (define checked (natural-index size))
+     (define count
+       (if (and checked (> checked 0))
+           checked
+           (error 'DRMG "make-array requires a positive integer size in ~e" whole)))
+     (define base (allocate sto count))
+     (for ([i (in-range count)])
+       (vector-set! sto (+ base i) init))
+     (ArrayV base count)]
     [('array (cons _ _))
      (define base (allocate sto (length vs)))
      (for ([v vs] [i (in-range (length vs))])
        (vector-set! sto (+ base i) v))
      (ArrayV base (length vs))]
     [('aref (list (ArrayV base size) (NumV index)))
-     (if (and (exact-nonnegative-integer? index) (< index size))
-         (cast (vector-ref sto (+ base index)) Value)
+     (define checked (natural-index index))
+     (if (and checked (< checked size))
+         (read-store sto (+ base checked))
          (error 'DRMG "aref index ~e out of bounds for array of size ~a in ~e"
                 index size whole))]
     [('aset! (list (ArrayV base size) (NumV index) val))
-     (if (and (exact-nonnegative-integer? index) (< index size))
+     (define checked (natural-index index))
+     (if (and checked (< checked size))
          (begin
-           (vector-set! sto (+ base index) val)
+           (vector-set! sto (+ base checked) val)
            (NullV))
          (error 'DRMG "aset! index ~e out of bounds for array of size ~a in ~e"
                 index size whole))]
@@ -218,14 +279,10 @@
      (error 'DRMG "array requires at least one element in ~e" whole)]
     [('make-array (list _ _))
      (error 'DRMG "make-array requires a positive integer size in ~e" whole)]
-    [('array '())
-     (error 'DRMG "array requires at least one element in ~e" whole)]
     [('aref (list _ _))
      (error 'DRMG "aref requires an array and a numeric index in ~e" whole)]
     [('aset! (list _ _ _))
      (error 'DRMG "aset! requires an array, a numeric index, and a value in ~e" whole)]
-    [('make-array (list _ _))
-     (error 'DRMG "make-array requires a positive integer size in ~e" whole)]
     [('error (list v))
      (error 'DRMG "user-error ~a in ~e" (serialize v) whole)]
     [((or '+ '- '* '/ '<= 'strlen 'substring 'equal?
@@ -242,13 +299,25 @@
     [(NumC n) (NumV n)]
     [(BoolC b) (BoolV b)]
     [(StrC s) (StrV s)]
-    [(IdC name) (cast (vector-ref sto (lookup name env)) Value)]
+    [(IdC name) (read-store sto (lookup name env))]
     [(IfC tst yes no)
      (match (interp tst env sto)
        [(BoolV #t) (interp yes env sto)]
        [(BoolV #f) (interp no env sto)]
        [v (error 'DRMG "if test must be boolean; received ~a in ~e" (serialize v) e)])]
     [(LamC ps body) (ClosureV ps body env)]
+    [(SetC name rhs)
+     (define loc (lookup name env))
+     (define v (interp rhs env sto))
+     (vector-set! sto loc v)
+     (NullV)]
+    [(RecC name rhs body)
+     (define loc (allocate sto 1))
+     (define extended (cons (Binding name loc) env))
+     (vector-set! sto loc (NullV))
+     (define v (interp rhs extended sto))
+     (vector-set! sto loc v)
+     (interp body extended sto)]
     [(AppC f args)
      (define fv (interp f env sto))
      (define av
@@ -270,12 +339,37 @@
     ([n '(true false + - * / <= substring strlen equal? error
                 make-array array aref aset!)]
      [i (in-range 1 16)])
-    (Binding n (cast i Natural))))
+    (define loc (natural-index i))
+    (if loc
+        (Binding n loc)
+        (error 'DRMG "invalid top-level store location: ~e" i))))
 
 ;; Parses and evaluates a program with a fresh store.
 (: top-interp (-> Sexp Natural String))
 (define (top-interp s memsize)
   (serialize (interp (parse s) top-env (make-initial-store memsize))))
+
+;; DRMG6 function: repeatedly calls body while the zero-argument guard returns true.
+;; A local binding sequences each body call before the next recursive call.
+(define while : Sexp
+  '{rocal [loop = {% guard body ->
+                    {if {guard}
+                        {local [unused = {body}] in {loop guard body}}
+                        false}}]
+     in loop})
+
+;; DRMG6 function: checks whether the given array's size elements strictly increase.
+;; The surrounding DRMG6 environment must bind while to the expression above.
+(define in-order : Sexp
+  '{% a size ->
+      {local [i = 1] [ordered = true] in
+        {local [unused =
+                 {while
+                  {% -> {if ordered {<= {+ i 1} size} false}}
+                  {% -> {if {<= {aref a i} {aref a {- i 1}}}
+                            {ordered := false}
+                            {i := {+ i 1}}}}}]
+          in ordered}}})
 
 
 ;; Tests for identifier validation and location-based environments.
@@ -301,6 +395,12 @@
                                   (make-initial-store 25))))
 
 ;; Tests parser support for literals, application, functions, and local desugaring.
+(check-equal? (parse-expr 5) (NumC 5))
+(check-exn #rx"DRMG" (lambda () (parse-expr #t)))
+(check-equal?
+ (parse-expr '(local [x = (+ 1 2)] in x))
+ (AppC (LamC '(x) (IdC 'x))
+       (list (AppC (IdC '+) (list (NumC 1) (NumC 2))))))
 (check-equal? (parse 5) (NumC 5))
 (check-equal? (parse "hi") (StrC "hi"))
 (check-equal? (parse '(if true 1 2)) (IfC (IdC 'true) (NumC 1) (NumC 2)))
@@ -588,3 +688,161 @@
 
 ;; Tests that existing store values are preserved.
 (check-equal? (vector-ref extra-env-sto 3) (PrimV '+))
+
+;; Tests natural-index using the approved integer? and exact? checks.
+(check-equal? (natural-index 0) 0)
+(check-equal? (natural-index 4) 4)
+(check-equal? (natural-index -1) #f)
+(check-equal? (natural-index 1/2) #f)
+(check-equal? (natural-index 2.0) #f)
+
+;; Tests reading ordinary values without casting store cells.
+(check-equal? (read-store (make-initial-store 20) 1) (BoolV #t))
+(check-exn #rx"DRMG.*allocation pointer"
+           (lambda () (read-store (make-initial-store 20) 0)))
+(check-equal? (expect-num (NumV 3) '+ (NumC 3)) 3)
+(check-exn #rx"DRMG.*number"
+           (lambda () (expect-num (StrV "bad") '+ (NumC 3))))
+
+;; Tests quoted string serialization, including escapes.
+(check-equal? (quote-string-rest "" 0) "\"")
+(check-equal? (serialize (StrV "")) "\"\"")
+(check-equal? (serialize (StrV "a\"b")) "\"a\\\"b\"")
+(check-equal? (serialize (StrV "a\\b")) "\"a\\\\b\"")
+(check-equal? (serialize (StrV "a\nb\t")) "\"a\\nb\\t\"")
+(check-equal? (serialize (NumV 1/2)) "1/2")
+
+;; Tests parsing assignment and a single recursive binding.
+(check-equal? (parse '(x := 9)) (SetC 'x (NumC 9)))
+(check-equal? (parse '(rocal [f = (% n -> n)] in (f 4)))
+              (RecC 'f (LamC '(n) (IdC 'n))
+                    (AppC (IdC 'f) (list (NumC 4)))))
+(check-equal? (check-invalid-symbols '(rocal)) #t)
+(check-exn #rx"DRMG" (lambda () (parse '(if := 3))))
+(check-exn #rx"DRMG" (lambda () (parse '(3 := 4))))
+(check-exn #rx"DRMG" (lambda () (parse '(x :=))))
+(check-exn #rx"DRMG" (lambda () (parse '(x := 1 2))))
+(check-exn #rx"DRMG" (lambda () (parse '(rocal in 3))))
+(check-exn #rx"DRMG" (lambda () (parse '(rocal [if = 1] in 3))))
+(check-exn #rx"DRMG" (lambda () (parse '(rocal [f 1] in 3))))
+(check-exn #rx"DRMG" (lambda () (parse '(rocal [f = 1] [g = 2] in 3))))
+(check-exn #rx"DRMG" (lambda () (parse '(% rocal -> 1))))
+
+;; Tests mutation results, existing bindings, and lexical scope.
+(check-equal? (top-interp '(local [x = 1] in (x := 9)) 40) "null")
+(check-equal?
+ (top-interp '(local [x = 1] in
+                (local [unused = (x := 9)] in x)) 40)
+ "9")
+(check-exn #rx"DRMG.*unbound" (lambda () (top-interp '(x := 4) 40)))
+(check-equal?
+ (top-interp '(local [x = 1] in
+                (local [get = (% -> x)] in
+                  (local [unused = (x := 9)] in (get)))) 50)
+ "9")
+(check-equal?
+ (top-interp '(local [x = 1] in
+                (local [f = (% x -> (x := 9))] in
+                  (local [unused = (f x)] in x))) 50)
+ "1")
+(check-equal?
+ (top-interp '(local [x = 1] in
+                (local [unused = (local [x = 2] in (x := 9))] in x)) 50)
+ "1")
+(check-equal?
+ (top-interp '(local [x = 1] in (equal? (x := 2) (x := 3))) 40)
+ "true")
+
+;; Tests recursive closure creation and calling the resulting function.
+(check-equal?
+ (top-interp '(rocal [fact = (% n ->
+                              (if (<= n 1) 1 (* n (fact (- n 1)))))]
+                    in (fact 5)) 100)
+ "120")
+(check-equal?
+ (top-interp '(rocal [fact = (% n ->
+                              (if (<= n 1) 1 (* n (fact (- n 1)))))]
+                    in (fact 0)) 40)
+ "1")
+(check-equal?
+ (top-interp '(local [f = 99] in
+                (rocal [f = (% n -> (if (<= n 0) 0 (+ 1 (f (- n 1)))))]
+                       in (f 3))) 100)
+ "3")
+(check-equal?
+ (top-interp '((rocal [f = (% n ->
+                            (if (<= n 0) 0 (+ 1 (f (- n 1)))))]
+                     in f) 4) 100)
+ "4")
+(check-exn #rx"DRMG.*out of memory"
+           (lambda () (top-interp '(rocal [f = (% -> 1)] in f) 16)))
+
+;; Tests function-position and argument evaluation from left to right.
+(check-equal?
+ (top-interp '(local [x = 0] in
+                ((% a b -> x) (x := 1) (x := 2))) 50)
+ "2")
+(check-equal?
+ (top-interp '(local [x = 0] in
+                (local [f = (% a -> x)] in
+                  ((local [unused = (x := 1)] in f)
+                   (x := 2)))) 50)
+ "2")
+(check-equal?
+ (top-interp '(local [x = 0] in
+                (local [a = (x := 7)] [b = x] in b)) 50)
+ "7")
+(check-equal?
+ (top-interp '(local [x = 0] in
+                (local [unused = (if true (x := 1) (x := 2))] in x)) 50)
+ "1")
+(check-equal?
+ (top-interp '(local [x = 0] in
+                (local [unused = (x := (local [u = (x := 2)] in (+ x 3)))]
+                  in x)) 50)
+ "5")
+
+;; Tests the required while expression with an initially false guard.
+(check-equal?
+ (top-interp
+  (list 'local (list 'while '= while) 'in
+        '(local [x = 0] in
+           (local [unused = (while (% -> false) (% -> (x := 99)))] in x)))
+  100)
+ "0")
+
+;; Tests repeated guard/body calls and termination.
+(check-equal?
+ (top-interp
+  (list 'local (list 'while '= while) 'in
+        '(local [x = 0] in
+           (local [unused = (while (% -> (<= x 3))
+                                  (% -> (x := (+ x 1))))] in x)))
+  100)
+ "4")
+
+;; Tests the required in-order expression using the DRMG6 while function.
+(check-equal?
+ (top-interp (list 'local (list 'while '= while) 'in
+                   (list in-order '(array 1 2 3 4) 4)) 200)
+ "true")
+(check-equal?
+ (top-interp (list 'local (list 'while '= while) 'in
+                   (list in-order '(array 1 2 2 4) 4)) 200)
+ "false")
+(check-equal?
+ (top-interp (list 'local (list 'while '= while) 'in
+                   (list in-order '(array 4 3 2 1) 4)) 200)
+ "false")
+(check-equal?
+ (top-interp (list 'local (list 'while '= while) 'in
+                   (list in-order '(array 1 3 2) 3)) 200)
+ "false")
+(check-equal?
+ (top-interp (list 'local (list 'while '= while) 'in
+                   (list in-order '(array 7) 1)) 100)
+ "true")
+(check-equal?
+ (top-interp (list 'local (list 'while '= while) 'in
+                   (list in-order '(array -3 -1 1/2 2.5) 4)) 200)
+ "true")
